@@ -19,13 +19,17 @@ func main() {
 
 	djangoURL := os.Getenv("HOSTPULSE_URL")
 	if djangoURL == "" {
-		djangoURL = "http://172.17.0"
+		djangoURL = "https://zedform.kz"
+	}
+
+	// Гарантируем слэш на конце базового URL для правильной склейки путей
+	if !strings.HasSuffix(djangoURL, "/") {
+		djangoURL += "/"
 	}
 
 	alertsURL := djangoURL + "api/v1/agent/events/"    // Для отправки падений контейнеров
 	heartbeatURL := djangoURL + "api/v1/heartbeat/"    // Для отправки пульса (онлайна)
 	commandURL := djangoURL + "api/v1/agent/commands/" // Для поллинга удаленных команд (если нужно)
-
 
 	agentToken := os.Getenv("HOSTPULSE_TOKEN")
 	if agentToken == "" {
@@ -33,13 +37,12 @@ func main() {
 	}
 	commandPassword := os.Getenv("HOSTPULSE_COMMAND_PASSWORD")
 
+	fmt.Printf(" [INFO] Базовый URL CRM: %s\n", djangoURL)
 	fmt.Printf(" Настройки: Отправка алертов на %s\n", alertsURL)
 	fmt.Printf(" Настройки: Отправка пульса на %s\n", heartbeatURL)
 
 	// ЗАПУСК ПУЛЬСА: Включаем фоновый независимый цикл отправки Heartbeat
-
 	go startHeartbeatTicker(heartbeatURL, agentToken)
-
 
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -48,47 +51,69 @@ func main() {
 			},
 		},
 	}
+
 	if commandPassword != "" {
 		fmt.Println(" [SECURITY] Переменная HOSTPULSE_COMMAND_PASSWORD найдена. Поллер команд успешно активирован.")
 		go startCommandPoller(commandURL, agentToken, commandPassword, client)
 	} else {
 		fmt.Println(" [⚠️ SECURITY WARNING] Переменная HOSTPULSE_COMMAND_PASSWORD пуста! Поллер удаленных команд отключен в целях безопасности.")
 	}
-	eventsURL := "http://localhost/v1.40/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22die%22%5D%7D"
-	resp, err := client.Get(eventsURL)
-	if err != nil {
-		panic(fmt.Errorf("ошибка подключения к Docker сокету: %v", err))
-	}
-	defer resp.Body.Close()
 
-	reader := bufio.NewReader(resp.Body)
+	// Бесконечный цикл верхнего уровня для автоматического ПЕРЕПОДКЛЮЧЕНИЯ к сокету
 	for {
-		line, err := reader.ReadString('\n')
+		fmt.Println(" [INFO] Подключение к Docker сокету для прослушивания событий...")
+
+		eventsURL := "http://localhost/v1.40/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22die%22%5D%7D"
+		resp, err := client.Get(eventsURL)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			fmt.Printf("Ошибка чтения событий: %v\n", err)
-			time.Sleep(2 * time.Second)
+			fmt.Printf(" [❌ ERROR] Ошибка подключения к Docker сокету: %v. Повтор через 5 секунд...\n", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		containerName := fetchJSONValue(line, `"name":`)
-		exitCode := fetchJSONValue(line, `"exitCode":`)
+		reader := bufio.NewReader(resp.Body)
 
-		if containerName == "" {
-			containerName = "Неизвестный контейнер"
+		// Внутренний цикл чтения потоковых строк от Docker
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					fmt.Println(" [⚠️ INFO] Стрим событий Docker завершился (EOF). Переподключение...")
+					break // Выходим из внутреннего цикла чтения, верхний цикл сразу сделает новый Get()
+				}
+				fmt.Printf("Ошибка чтения событий: %v\n", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			// ИСПРАВЛЕНИЕ: Если в строке нет ID контейнера, это технический мусор чанка Docker-стрима, игнорируем его
+			containerID := fetchJSONValue(line, `"id":`)
+			if containerID == "" {
+				continue
+			}
+
+			containerName := fetchJSONValue(line, `"name":`)
+			exitCode := fetchJSONValue(line, `"exitCode":`)
+
+			if containerName == "" {
+				containerName = "Неизвестный контейнер"
+			}
+
+			fmt.Printf("\n[ALERT] Упал контейнер: %s (Exit Code: %s)\n", containerName, exitCode)
+
+			if containerID != "" {
+				logs := getContainerLogs(client, containerID)
+				// ИСПРАВЛЕНИЕ: передаем правильный alertsURL вместо старого djangoURL
+				go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
+			}
 		}
 
-		fmt.Printf("\n[ALERT] Упал контейнер: %s (Exit Code: %s)\n", containerName, exitCode)
-
-		containerID := fetchJSONValue(line, `"id":`)
-		if containerID != "" {
-			logs := getContainerLogs(client, containerID)
-			go sendAlertService(djangoURL, agentToken, containerName, containerID, exitCode, logs)
-		}
+		// Безопасно закрываем текущий Body перед открытием нового соединения в следующем тике
+		resp.Body.Close()
+		time.Sleep(1 * time.Second)
 	}
 }
+
 
 // Фоновая горутина для регулярной отправки пинга "Я жив"
 func startHeartbeatTicker(url, token string) {
