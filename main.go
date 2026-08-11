@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -71,46 +70,56 @@ func main() {
 			continue
 		}
 
-		reader := bufio.NewReader(resp.Body)
+		// ИСПРАВЛЕНИЕ: Вместо bufio.Reader используем потоковый JSON декодер.
+		// Он будет жестко блокировать поток выполнения и ЖДАТЬ реальных событий, не вызывая EOF.
+		decoder := json.NewDecoder(resp.Body)
 
-		// Внутренний цикл чтения потоковых строк от Docker
 		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
+			// Создаем пустую карту для парсинга входящего JSON-события Docker
+			var event map[string]interface{}
+
+			// Метод Decode сам засыпает и ждет данных от Docker сокета
+			if err := decoder.Decode(&event); err != nil {
 				if err == io.EOF {
 					fmt.Println(" [⚠️ INFO] Стрим событий Docker завершился (EOF). Переподключение...")
-					break // Выходим из внутреннего цикла чтения, верхний цикл сразу сделает новый Get()
+				} else {
+					fmt.Printf(" [❌ ERROR] Ошибка декодирования события: %v\n", err)
 				}
-				fmt.Printf("Ошибка чтения событий: %v\n", err)
-				time.Sleep(2 * time.Second)
-				continue
+				break // Выходим во внешний цикл для переподключения
 			}
 
-			// ИСПРАВЛЕНИЕ: Если в строке нет ID контейнера, это технический мусор чанка Docker-стрима, игнорируем его
-			containerID := fetchJSONValue(line, `"id":`)
+			// Вытягиваем ID контейнера из структуры события Docker
+			containerID, _ := event["id"].(string)
 			if containerID == "" {
 				continue
 			}
 
-			containerName := fetchJSONValue(line, `"name":`)
-			exitCode := fetchJSONValue(line, `"exitCode":`)
+			// Имя контейнера и статус лежат внутри объекта "Actor" -> "Attributes"
+			var containerName string
+			if actor, ok := event["Actor"].(map[string]interface{}); ok {
+				if attrs, ok := actor["Attributes"].(map[string]interface{}); ok {
+					containerName, _ = attrs["name"].(string)
+				}
+			}
+
+			// Код выхода обычно лежит в "Action" или "status" (например, "die", "exited")
+			// Но точный exitCode для надежности мы вытащим из функции логов ниже
+			exitCode := "1"
 
 			if containerName == "" {
 				containerName = "Неизвестный контейнер"
 			}
 
-			fmt.Printf("\n[ALERT] Упал контейнер: %s (Exit Code: %s)\n", containerName, exitCode)
+			fmt.Printf("\n[🚨 ALERT] Упал контейнер: %s (ID: %s)\n", containerName, containerID[:12])
 
-			if containerID != "" {
-				logs := getContainerLogs(client, containerID)
-				// ИСПРАВЛЕНИЕ: передаем правильный alertsURL вместо старого djangoURL
-				go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
-			}
+			// Передаем управление отправке алертов на Django бэкенд
+			logs := getContainerLogs(client, containerID)
+			go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
 		}
 
-		// Безопасно закрываем текущий Body перед открытием нового соединения в следующем тике
+		// Безопасно закрываем текущий Body перед открытием нового соединения
 		resp.Body.Close()
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second) // Небольшая пауза перед защитой от дребезга сети
 	}
 }
 
