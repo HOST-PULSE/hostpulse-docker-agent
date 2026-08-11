@@ -22,16 +22,18 @@ func main() {
 		djangoURL = "http://172.17.0"
 	}
 
+	alertsURL := djangoURL + "api/v1/agent/events/"    // Для отправки падений контейнеров
+	heartbeatURL := djangoURL + "api/v1/heartbeat/"    // Для отправки пульса (онлайна)
+	commandURL := djangoURL + "api/v1/agent/commands/" // Для поллинга удаленных команд (если нужно)
+
+
 	agentToken := os.Getenv("HOSTPULSE_TOKEN")
 	if agentToken == "" {
 		agentToken = "hostpulse_secret_token_123"
 	}
 	commandPassword := os.Getenv("HOSTPULSE_COMMAND_PASSWORD")
 
-	// Автоматически формируем URL для отправки пульса (заменяем alerts на heartbeat)
-	heartbeatURL := strings.Replace(djangoURL, "/alerts/", "/heartbeat/", 1)
-
-	fmt.Printf(" Настройки: Отправка алертов на %s\n", djangoURL)
+	fmt.Printf(" Настройки: Отправка алертов на %s\n", alertsURL)
 	fmt.Printf(" Настройки: Отправка пульса на %s\n", heartbeatURL)
 
 	// ЗАПУСК ПУЛЬСА: Включаем фоновый независимый цикл отправки Heartbeat
@@ -48,7 +50,7 @@ func main() {
 	}
 	if commandPassword != "" {
 		fmt.Println(" [SECURITY] Переменная HOSTPULSE_COMMAND_PASSWORD найдена. Поллер команд успешно активирован.")
-		go startCommandPoller(djangoURL, agentToken, commandPassword, client)
+		go startCommandPoller(commandURL, agentToken, commandPassword, client)
 	} else {
 		fmt.Println(" [⚠️ SECURITY WARNING] Переменная HOSTPULSE_COMMAND_PASSWORD пуста! Поллер удаленных команд отключен в целях безопасности.")
 	}
@@ -101,9 +103,8 @@ func startHeartbeatTicker(url, token string) {
 	}
 }
 
-func startCommandPoller(baseURL, token, localPassword string, client *http.Client) {
+func startCommandPoller(commandsURL, token, localPassword string, client *http.Client) {
 	// Формируем URL очереди команд
-	commandsURL := strings.Replace(baseURL, "/alerts/", "/commands/", 1)
 	ticker := time.NewTicker(2 * time.Second)
 
 	for range ticker.C {
