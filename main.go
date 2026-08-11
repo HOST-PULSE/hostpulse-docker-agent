@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -10,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"time"
-    "encoding/json"
 )
 
 func main() {
@@ -21,14 +21,13 @@ func main() {
 		djangoURL = "https://zedform.kz"
 	}
 
-	// Гарантируем слэш на конце базового URL для правильной склейки путей
 	if !strings.HasSuffix(djangoURL, "/") {
 		djangoURL += "/"
 	}
 
-	alertsURL := djangoURL + "api/v1/alerts/"    // Для отправки падений контейнеров
-	heartbeatURL := djangoURL + "api/v1/heartbeat/"    // Для отправки пульса (онлайна)
-	commandURL := djangoURL + "api/v1/agent/commands/" // Для поллинга удаленных команд (если нужно)
+	alertsURL := djangoURL + "api/v1/alerts/"
+	heartbeatURL := djangoURL + "api/v1/heartbeat/"
+	commandURL := djangoURL + "api/v1/agent/commands/"
 
 	agentToken := os.Getenv("HOSTPULSE_TOKEN")
 	if agentToken == "" {
@@ -40,7 +39,6 @@ func main() {
 	fmt.Printf(" Настройки: Отправка алертов на %s\n", alertsURL)
 	fmt.Printf(" Настройки: Отправка пульса на %s\n", heartbeatURL)
 
-	// ЗАПУСК ПУЛЬСА: Включаем фоновый независимый цикл отправки Heartbeat
 	go startHeartbeatTicker(heartbeatURL, agentToken)
 
 	client := &http.Client{
@@ -49,6 +47,7 @@ func main() {
 				return net.Dial("unix", "/var/run/docker.sock")
 			},
 		},
+		Timeout: 0,
 	}
 
 	if commandPassword != "" {
@@ -58,11 +57,11 @@ func main() {
 		fmt.Println(" [⚠️ SECURITY WARNING] Переменная HOSTPULSE_COMMAND_PASSWORD пуста! Поллер удаленных команд отключен в целях безопасности.")
 	}
 
-	// Бесконечный цикл верхнего уровня для автоматического ПЕРЕПОДКЛЮЧЕНИЯ к сокету
+	// Бесконечный цикл верхнего уровня для автоматического ПЕРЕПОДКЛЮЧЕНИЯ
 	for {
 		fmt.Println(" [INFO] Подключение к Docker сокету для прослушивания событий...")
 
-		eventsURL := "http://localhost/v1.40/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22die%22%5D%7D"
+		eventsURL := "http://localhost/events"
 		resp, err := client.Get(eventsURL)
 		if err != nil {
 			fmt.Printf(" [❌ ERROR] Ошибка подключения к Docker сокету: %v. Повтор через 5 секунд...\n", err)
@@ -70,58 +69,102 @@ func main() {
 			continue
 		}
 
-		// ИСПРАВЛЕНИЕ: Вместо bufio.Reader используем потоковый JSON декодер.
-		// Он будет жестко блокировать поток выполнения и ЖДАТЬ реальных событий, не вызывая EOF.
 		decoder := json.NewDecoder(resp.Body)
 
+		// ВНУТРЕННИЙ ЦИКЛ: Читаем бесконечный поток событий из сокета
 		for {
-			// Создаем пустую карту для парсинга входящего JSON-события Docker
 			var event map[string]interface{}
 
-			// Метод Decode сам засыпает и ждет данных от Docker сокета
 			if err := decoder.Decode(&event); err != nil {
 				if err == io.EOF {
 					fmt.Println(" [⚠️ INFO] Стрим событий Docker завершился (EOF). Переподключение...")
 				} else {
 					fmt.Printf(" [❌ ERROR] Ошибка декодирования события: %v\n", err)
 				}
-				break // Выходим во внешний цикл для переподключения
+				break
 			}
 
-			// Вытягиваем ID контейнера из структуры события Docker
-			containerID, _ := event["id"].(string)
-			if containerID == "" {
-				continue
-			}
-
-			// Имя контейнера и статус лежат внутри объекта "Actor" -> "Attributes"
-			var containerName string
-			if actor, ok := event["Actor"].(map[string]interface{}); ok {
-				if attrs, ok := actor["Attributes"].(map[string]interface{}); ok {
-					containerName, _ = attrs["name"].(string)
-				}
-			}
-
-			// Код выхода обычно лежит в "Action" или "status" (например, "die", "exited")
-			// Но точный exitCode для надежности мы вытащим из функции логов ниже
-			exitCode := "1"
-
-			if containerName == "" {
-				containerName = "Неизвестный контейнер"
-			}
-
-			fmt.Printf("\n[🚨 ALERT] Упал контейнер: %s (ID: %s)\n", containerName, containerID[:12])
-
-			// Передаем управление отправке алертов на Django бэкенд
-			logs := getContainerLogs(client, containerID)
-			go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
+			// Вызываем наш выделенный метод обработки события
+			handleDockerEvent(event, client, alertsURL, agentToken)
 		}
 
-		// Безопасно закрываем текущий Body перед открытием нового соединения
 		resp.Body.Close()
-		time.Sleep(2 * time.Second) // Небольшая пауза перед защитой от дребезга сети
+		time.Sleep(2 * time.Second)
 	}
 }
+
+// Выделенный метод обработки, фильтрации и отправки алертов
+// Выделенный метод обработки, фильтрации и отправки алертов
+func handleDockerEvent(event map[string]interface{}, client *http.Client, alertsURL string, agentToken string) {
+	// Оставляем логирование для контроля
+	//eventJSON, _ := json.Marshal(event)
+	//fmt.Printf("\n[⚙️ DOCKER RAW EVENT]: %s\n", string(eventJSON))
+
+	// 1. Фильтруем тип объекта
+	typ, _ := event["Type"].(string)
+	if typ != "container" {
+		return
+	}
+
+	// 2. Ловим только действия 'die' и 'stop'
+	action, _ := event["Action"].(string)
+	if action != "die" && action != "stop" {
+		return
+	}
+
+	// 3. УЛЬТРА-НАДЕЖНОЕ ПОЛУЧЕНИЕ ID КОНТЕЙНЕРА
+	var containerID string
+
+	// Сначала пробуем взять из корня (маленькими буквами)
+	if id, ok := event["id"].(string); ok && id != "" {
+		containerID = id
+	}
+
+	// Вытягиваем Actor для глубокого разбора
+	var actorMap map[string]interface{}
+	if actor, ok := event["Actor"].(map[string]interface{}); ok {
+		actorMap = actor
+		// Если в корне не нашли, берем из Actor.ID (как в вашем логе)
+		if containerID == "" {
+			if id, ok := actor["ID"].(string); ok {
+				containerID = id
+			}
+		}
+	}
+
+	// Если ID так и не нашли, только тогда выходим
+	if containerID == "" {
+		fmt.Println(" [⚠️ DEBUG] Пропущено событие: не удалось найти ID контейнера")
+		return
+	}
+
+	containerName := "Неизвестный контейнер"
+	exitCode := "1"
+
+	// 4. Безопасно вытягиваем Имя и exitCode из Attributes
+	if actorMap != nil {
+		if attrs, ok := actorMap["Attributes"].(map[string]interface{}); ok {
+			if name, found := attrs["name"].(string); found {
+				containerName = name
+			}
+			if code, found := attrs["exitCode"].(string); found {
+				exitCode = code
+			}
+		}
+	}
+
+	// 5. ВЫВОД АЛЕРТА (Теперь он железно сработает)
+	fmt.Printf("\n[🚨 ALERT] Зафиксировано событие '%s' на контейнере: %s (ID: %s, ExitCode: %s)\n",
+		action, containerName, containerID[:12], exitCode)
+
+	// 6. Запрашиваем логи контейнера
+	logs := getContainerLogs(client, containerID)
+
+	// 7. Асинхронно отправляем алерт на Django бэкенд
+	go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
+}
+
+
 
 
 // Фоновая горутина для регулярной отправки пинга "Я жив"
