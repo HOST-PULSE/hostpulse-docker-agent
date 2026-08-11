@@ -26,7 +26,7 @@ func main() {
 		djangoURL += "/"
 	}
 
-	alertsURL := djangoURL + "api/v1/agent/events/"    // Для отправки падений контейнеров
+	alertsURL := djangoURL + "api/v1/alerts/"    // Для отправки падений контейнеров
 	heartbeatURL := djangoURL + "api/v1/heartbeat/"    // Для отправки пульса (онлайна)
 	commandURL := djangoURL + "api/v1/agent/commands/" // Для поллинга удаленных команд (если нужно)
 
