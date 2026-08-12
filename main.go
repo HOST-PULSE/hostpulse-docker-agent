@@ -94,12 +94,7 @@ func main() {
 }
 
 // Выделенный метод обработки, фильтрации и отправки алертов
-// Выделенный метод обработки, фильтрации и отправки алертов
 func handleDockerEvent(event map[string]interface{}, client *http.Client, alertsURL string, agentToken string) {
-	// Оставляем логирование для контроля
-	//eventJSON, _ := json.Marshal(event)
-	//fmt.Printf("\n[⚙️ DOCKER RAW EVENT]: %s\n", string(eventJSON))
-
 	// 1. Фильтруем тип объекта
 	typ, _ := event["Type"].(string)
 	if typ != "container" {
@@ -153,14 +148,13 @@ func handleDockerEvent(event map[string]interface{}, client *http.Client, alerts
 		}
 	}
 
-	// 5. ВЫВОД АЛЕРТА (Теперь он железно сработает)
 	fmt.Printf("\n[🚨 ALERT] Зафиксировано событие '%s' на контейнере: %s (ID: %s, ExitCode: %s)\n",
 		action, containerName, containerID[:12], exitCode)
 
-	// 6. Запрашиваем логи контейнера
+	//Запрашиваем логи контейнера
 	logs := getContainerLogs(client, containerID)
 
-	// 7. Асинхронно отправляем алерт на Django бэкенд
+	// Асинхронно отправляем алерт
 	go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
 }
 
@@ -249,7 +243,7 @@ func sendHeartbeat(url, token string) {
 		fmt.Printf(" [Heartbeat] Ошибка сборки запроса: %v\n", err)
 		return
 	}
-
+	req.Header.Set("X-Agent-Type", "docker_monitor")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", token)
 
@@ -297,22 +291,21 @@ func cleanLogs(raw string) string {
 }
 
 func sendAlertService(url, token, name, id, exitCode, logs string) {
-	// 1. Создаем структуру (map) с данными
 	payload := map[string]string{
 		"container_name": name,
 		"container_id":   id,
 		"exit_code":      exitCode,
-		"logs":           logs, // Передаем логи как есть, без ручных замен!
+		"logs":           logs,
 	}
 
-	// 2. Превращаем map в идеальный валидный JSON-байт-массив
+	// Превращаем map в идеальный валидный JSON-байт-массив
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		fmt.Printf("Ошибка маршалинга JSON: %v\n", err)
 		return
 	}
 
-	// 3. Передаем bytes.NewBuffer(jsonBytes) в запрос
+	// Передаем bytes.NewBuffer(jsonBytes) в запрос
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBytes))
 	if err != nil {
 		fmt.Printf("Ошибка создания HTTP запроса: %v\n", err)
