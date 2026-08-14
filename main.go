@@ -110,7 +110,7 @@ func handleDockerEvent(event map[string]interface{}, client *http.Client, alerts
 
 	// 2. Ловим только действия 'die' и 'stop'
 	action, _ := event["Action"].(string)
-	if action != "die" && action != "stop" {
+	if action != "die" && action != "stop" && action != "start" {
 		return
 	}
 
@@ -133,14 +133,22 @@ func handleDockerEvent(event map[string]interface{}, client *http.Client, alerts
 			}
 		}
 	}
-	if shouldSkipEvent(containerID) {
-		return
-	}
 	// Если ID так и не нашли, только тогда выходим
 	if containerID == "" {
 		fmt.Println(" [⚠️ DEBUG] Пропущено событие: не удалось найти ID контейнера")
 		return
 	}
+	if action == "die" || action == "stop" {
+		if shouldSkipEvent(containerID) {
+			// Если за последние 2 секунды этот контейнер уже завершал работу — игнорируем дублирующий stop
+			return
+		}
+	}
+	if action == "stop" {
+		action = "die"
+	}
+
+
 
 	containerName := "Неизвестный контейнер"
 	exitCode := "1"
@@ -156,12 +164,18 @@ func handleDockerEvent(event map[string]interface{}, client *http.Client, alerts
 			}
 		}
 	}
-
+	if action == "start" {
+		exitCode = "0"
+	}
 	fmt.Printf("\n[🚨 ALERT] Зафиксировано событие '%s' на контейнере: %s (ID: %s, ExitCode: %s)\n",
 		action, containerName, containerID[:12], exitCode)
-
+	var logs string
 	//Запрашиваем логи контейнера
-	logs := getContainerLogs(client, containerID)
+	if action == "die" {
+		logs = getContainerLogs(client, containerID)
+	} else if action == "start" {
+		logs = "Контейнер успешно запущен в продакшн контуре."
+	}
 
 	// Асинхронно отправляем алерт
 	go sendAlertService(alertsURL, agentToken, containerName, containerID, exitCode, logs)
