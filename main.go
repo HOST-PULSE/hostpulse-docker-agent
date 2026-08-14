@@ -7,11 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"net/http"
 	"os"
 	"encoding/binary"
 	"strings"
 	"time"
+)
+
+var (
+	processedEvents   = make(map[string]time.Time)
+	processedEventsMu sync.Mutex
 )
 
 func main() {
@@ -127,7 +133,9 @@ func handleDockerEvent(event map[string]interface{}, client *http.Client, alerts
 			}
 		}
 	}
-
+	if shouldSkipEvent(containerID) {
+		return
+	}
 	// Если ID так и не нашли, только тогда выходим
 	if containerID == "" {
 		fmt.Println(" [⚠️ DEBUG] Пропущено событие: не удалось найти ID контейнера")
@@ -397,4 +405,20 @@ func fetchJSONValue(jsonStr, key string) string {
 		}
 	}
 	return strings.TrimSpace(result.String())
+}
+func shouldSkipEvent(containerID string) bool {
+	processedEventsMu.Lock()
+	defer processedEventsMu.Unlock()
+
+	now := time.Now()
+	// Если событие по этому контейнеру уже было меньше 2 секунд назад — скипаем
+	if lastTime, exists := processedEvents[containerID]; exists {
+		if now.Sub(lastTime) < 2*time.Second {
+			return true
+		}
+	}
+
+	// Запоминаем текущее время обработки
+	processedEvents[containerID] = now
+	return false
 }
