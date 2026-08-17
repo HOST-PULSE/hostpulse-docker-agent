@@ -19,7 +19,14 @@ var (
 	processedEvents   = make(map[string]time.Time)
 	processedEventsMu sync.Mutex
 )
-
+type DjangoCommandResponse struct {
+	Command *struct {
+		ID          int    `json:"id"`
+		Type        string `json:"type"`
+		ContainerID string `json:"container_id"`
+		Password    string `json:"password"`
+	} `json:"command"`
+}
 func main() {
 	fmt.Println("=== Агент HostPulse успешно запущен и слушает Docker Events ===")
 
@@ -197,8 +204,8 @@ func startHeartbeatTicker(url, token string) {
 	}
 }
 
-func startCommandPoller(commandsURL, token, localPassword string, client *http.Client) {
-	// Формируем URL очереди команд
+func startCommandPoller(commandsURL, token, localPassword string, dockerClient *http.Client) {
+	// commandsURL передавай как базовый путь, например: "https://hostpulse.link"
 	ticker := time.NewTicker(2 * time.Second)
 
 	for range ticker.C {
@@ -207,58 +214,66 @@ func startCommandPoller(commandsURL, token, localPassword string, client *http.C
 
 		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 		if err != nil {
-			continue // если бэкенд мигнул, просто ждем следующий тик
+			continue // бэкенд мигнул — ждем следующий тик
 		}
 
 		if resp.StatusCode == http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			jsonStr := string(bodyBytes)
-			commandID := fetchJSONValue(jsonStr, `"command_id":`)
-			containerID := fetchJSONValue(jsonStr, `"container_id":`)
-			incomingPassword := fetchJSONValue(jsonStr, `"password":`) // <-- Читаем пароль от CRM
-
-			if containerID != "" {
-				fmt.Printf(" [COMMAND] Получена команда %s на перезапуск контейнера %s\n", commandID, containerID[:12])
-
-				var success bool
-
-				// ПРОВЕРКА БЕЗОПАСНОСТИ: Сверяем пароль от CRM с локальной переменной
-				if incomingPassword != localPassword {
-					fmt.Printf(" [⚠️ SECURITY ALERT] Отклонено! Неверный пароль команды для контейнера %s\n", containerID[:12])
-					success = false // Блокируем выполнение и ставим статус "провал"
-				} else {
-					// Если пароли совпали — выполняем перезапуск через Docker сокет
-					restartURL := fmt.Sprintf("http://localhost/v1.40/containers/%s/restart", containerID)
-					restartReq, _ := http.NewRequest("POST", restartURL, nil)
-
-					restartResp, err := client.Do(restartReq)
-					success = err == nil && restartResp.StatusCode == http.StatusNoContent
-					if restartResp != nil {
-						restartResp.Body.Close()
-					}
-				}
-
-				// Отчитываемся перед Django, что команда обработана (успешно или заблокирована)
-				confirmURL := fmt.Sprintf("%s%s/confirm/", commandsURL, commandID)
-				statusPayload := fmt.Sprintf(`{"success": %t}`, success)
-				confirmReq, _ := http.NewRequest("POST", confirmURL, bytes.NewBuffer([]byte(statusPayload)))
-				confirmReq.Header.Set("X-Agent-Token", token)
-				confirmReq.Header.Set("Content-Type", "application/json")
-
-				confirmResp, _ := (&http.Client{Timeout: 5 * time.Second}).Do(confirmReq)
-				if confirmResp != nil {
-					confirmResp.Body.Close()
-				}
-				fmt.Println(" [COMMAND] Статус выполнения команды отправлен на бэкенд.")
+			var djangoResp DjangoCommandResponse
+			// Используем безопасный демаршалинг вместо fetchJSONValue
+			if err := json.Unmarshal(bodyBytes, &djangoResp); err != nil || djangoResp.Command == nil {
+				continue // команд в очереди нет, пропускаем тик
 			}
+
+			cmd := djangoResp.Command
+			displayID := fmt.Sprintf("%d", cmd.ID)
+
+			// Безопасно срезаем длину для красивого лога
+			displayContainer := cmd.ContainerID
+			if len(displayContainer) > 12 {
+				displayContainer = displayContainer[:12]
+			}
+
+			fmt.Printf(" 📥 [COMMAND] Получена команда %s на перезапуск контейнера %s\n", displayID, displayContainer)
+			var success bool
+
+			// ПРОВЕРКА БЕЗОПАСНОСТИ: Сверяем пароль от CRM с локальной переменной на хосте
+			if cmd.Password != localPassword {
+				fmt.Printf(" ⚠️ [SECURITY ALERT] Отклонено! Неверный пароль команды для контейнера %s\n", displayContainer)
+				success = false
+			} else {
+				// Если пароли совпали — шлем POST в Docker UNIX сокет
+				restartURL := fmt.Sprintf("http://localhost/v1.40/containers/%s/restart", cmd.ContainerID)
+				restartReq, _ := http.NewRequest("POST", restartURL, nil)
+
+				restartResp, err := dockerClient.Do(restartReq)
+				success = err == nil && restartResp.StatusCode == http.StatusNoContent
+				if restartResp != nil {
+					restartResp.Body.Close()
+				}
+			}
+
+			// Отчитываемся перед Django (HostPulseConfirmCommandView)
+			// Пересобираем URL строго под джанговский роутер: /commands/<id>/confirm/
+			confirmURL := fmt.Sprintf("%s%d/confirm/", commandsURL, cmd.ID)
+
+			statusPayload := fmt.Sprintf(`{"success": %t}`, success)
+			confirmReq, _ := http.NewRequest("POST", confirmURL, bytes.NewBuffer([]byte(statusPayload)))
+			confirmReq.Header.Set("X-Agent-Token", token)
+			confirmReq.Header.Set("Content-Type", "application/json")
+
+			confirmResp, _ := (&http.Client{Timeout: 5 * time.Second}).Do(confirmReq)
+			if confirmResp != nil {
+				confirmResp.Body.Close()
+			}
+			fmt.Println(" 📤 [COMMAND] Статус выполнения команды успешно отправлен на бэкенд.")
 		} else {
 			resp.Body.Close()
 		}
 	}
 }
-
 // Функция отправки HTTP POST запроса пульса
 func sendHeartbeat(url, token string) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte("{}")))
