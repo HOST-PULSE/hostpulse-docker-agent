@@ -41,7 +41,7 @@ func main() {
 
 	alertsURL := djangoURL + "api/v1/alerts/"
 	heartbeatURL := djangoURL + "api/v1/heartbeat/"
-	commandURL := djangoURL + "api/v1/agent/commands/"
+	commandURL := djangoURL + "api/v1/commands/"
 
 	agentToken := os.Getenv("HOSTPULSE_TOKEN")
 	if agentToken == "" {
@@ -52,6 +52,7 @@ func main() {
 	fmt.Printf(" [INFO] Базовый URL CRM: %s\n", djangoURL)
 	fmt.Printf(" Настройки: Отправка алертов на %s\n", alertsURL)
 	fmt.Printf(" Настройки: Отправка пульса на %s\n", heartbeatURL)
+	fmt.Printf(" Настройки: Отправка команд на %s\n", commandURL)
 
 	go startHeartbeatTicker(heartbeatURL, agentToken)
 
