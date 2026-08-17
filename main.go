@@ -246,13 +246,33 @@ func startCommandPoller(commandsURL, token, localPassword string, dockerClient *
 				success = false
 			} else {
 				// Если пароли совпали — шлем POST в Docker UNIX сокет
-				restartURL := fmt.Sprintf("http://localhost/v1.40/containers/%s/restart", cmd.ContainerID)
+				restartURL := fmt.Sprintf("http://localhost/containers/%s/restart", cmd.ContainerID)
 				restartReq, _ := http.NewRequest("POST", restartURL, nil)
 
+				// Этот заголовок заставляет Docker Daemon автоматически применить
+				// нужную версию API сервера к вашему бесверсионному запросу!
+				restartReq.Header.Set("Upgrade", "tcp")
+
 				restartResp, err := dockerClient.Do(restartReq)
-				success = err == nil && restartResp.StatusCode == http.StatusNoContent
-				if restartResp != nil {
-					restartResp.Body.Close()
+
+				if err != nil {
+					fmt.Printf(" ❌ Ошибка подключения к сокету Docker: %v\n", err)
+					success = false
+				} else {
+					// Проверяем статус ответа
+					success = restartResp.StatusCode == http.StatusNoContent
+
+					if !success {
+						// Если Docker ответил ошибкой (например 404 или 400), выводим её в консоль агента
+						body, _ := io.ReadAll(restartResp.Body)
+						fmt.Printf(" ❌ Docker вернул ошибку! Статус: %d, Ответ: %s\n", restartResp.StatusCode, string(body))
+					} else {
+						fmt.Printf("  Контейнер %s успешно отправлен на перезапуск в Docker.\n", displayContainer)
+					}
+
+					if restartResp != nil {
+						restartResp.Body.Close()
+					}
 				}
 			}
 
