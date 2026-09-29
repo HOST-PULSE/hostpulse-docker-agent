@@ -37,7 +37,7 @@ func main() {
 	if agentToken == "" {
 		agentToken = "hostpulse_secret_token_123"
 	}
-	commandPassword := os.Getenv("HOSTPULSE_COMMAND_PASSWORD")
+	commandPassword := os.Getenv("HOSTPULSE_SECRET")
 
 	fmt.Printf(" [INFO] Базовый URL CRM: %s\n", djangoURL)
 	fmt.Printf(" Настройки: Отправка алертов на %s\n", alertsURL)
