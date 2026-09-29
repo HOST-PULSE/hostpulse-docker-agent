@@ -30,10 +30,10 @@ func sendHeartbeat(url, token string) {
 		fmt.Printf(" [Heartbeat] Ошибка сборки запроса: %v\n", err)
 		return
 	}
-	req.Header.Set("X-Agent-Type", "docker_agent")
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", token)
-
+	req.Header.Set("X-Agent-Type", "docker_agent")
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
